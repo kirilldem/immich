@@ -139,10 +139,10 @@ export class MetadataRepository implements IMetadataRepository {
     const lineReader = readLine.createInterface({ input: input });
 
     const adminMap = new Map<string, string>();
-    for await (const line of lineReader) {
+    lineReader.on('line', (line) => {
       const lineSplit = line.split('\t');
       adminMap.set(lineSplit[0], lineSplit[1]);
-    }
+    });
 
     return adminMap;
   }
