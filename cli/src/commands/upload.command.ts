@@ -3,8 +3,7 @@ import byteSize from 'byte-size';
 import cliProgress from 'cli-progress';
 import { chunk, zip } from 'lodash-es';
 import { createHash } from 'node:crypto';
-import fs, { createReadStream } from 'node:fs';
-import { access, constants, stat, unlink } from 'node:fs/promises';
+import fs from 'node:fs/promises';
 import os from 'node:os';
 import { basename } from 'node:path';
 import { ImmichApi } from 'src/services/api.service';
@@ -35,7 +34,7 @@ class Asset {
   }
 
   async prepare() {
-    const stats = await stat(this.path);
+    const stats = await fs.stat(this.path);
     this.deviceAssetId = `${basename(this.path)}-${stats.size}`.replaceAll(/\s+/g, '');
     this.fileCreatedAt = stats.mtime;
     this.fileModifiedAt = stats.mtime;
@@ -58,12 +57,11 @@ class Asset {
     const sideCarPath = `${this.path}.xmp`;
     let sidecarData: Blob | undefined = undefined;
     try {
-      await access(sideCarPath, constants.R_OK);
-      sidecarData = new File([await fs.openAsBlob(sideCarPath)], basename(sideCarPath));
+      sidecarData = new File([await fs.readFile(sideCarPath)], basename(sideCarPath));
     } catch {}
 
     const data: any = {
-      assetData: new File([await fs.openAsBlob(this.path)], basename(this.path)),
+      assetData: new File([await fs.readFile(this.path)], basename(this.path)),
       deviceAssetId: this.deviceAssetId,
       deviceId: 'CLI',
       fileCreatedAt: this.fileCreatedAt,
@@ -84,18 +82,14 @@ class Asset {
   }
 
   async delete(): Promise<void> {
-    return unlink(this.path);
+    return fs.unlink(this.path);
   }
 
   public async hash(): Promise<string> {
-    const sha1 = (filePath: string) => {
+    const sha1 = async (filePath: string) => {
       const hash = createHash('sha1');
-      return new Promise<string>((resolve, reject) => {
-        const rs = createReadStream(filePath);
-        rs.on('error', reject);
-        rs.on('data', (chunk) => hash.update(chunk));
-        rs.on('end', () => resolve(hash.digest('hex')));
-      });
+      hash.update(await fs.readFile(filePath));
+      return hash.digest('hex');
     };
 
     return await sha1(this.path);
@@ -252,7 +246,7 @@ export class UploadCommand extends BaseCommand {
   public async getFiles(paths: string[], options: UploadOptionsDto): Promise<string[]> {
     const inputFiles: string[] = [];
     for (const pathArgument of paths) {
-      const fileStat = await fs.promises.lstat(pathArgument);
+      const fileStat = await fs.lstat(pathArgument);
       if (fileStat.isFile()) {
         inputFiles.push(pathArgument);
       }
