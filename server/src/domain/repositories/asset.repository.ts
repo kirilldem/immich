@@ -1,8 +1,7 @@
 import { AssetSearchOptions, ReverseGeocodeResult, SearchExploreItem } from '@app/domain';
 import { AssetEntity, AssetJobStatusEntity, AssetOrder, AssetType, ExifEntity } from '@app/infra/entities';
-import { FindOptionsRelations, FindOptionsSelect } from 'typeorm';
+import { Prisma } from '@prisma/client';
 import { Paginated, PaginationOptions } from '../domain.util';
-
 export type AssetStats = Record<AssetType, number>;
 
 export interface AssetStatsOptions {
@@ -74,6 +73,24 @@ export interface TimeBucketItem {
   count: number;
 }
 
+// saving relations with AssetEntity is painful
+export type AssetEntityWithoutRelations = {
+  [K in keyof Omit<
+    AssetEntity,
+    | 'livePhotoVideo'
+    | 'stack'
+    | 'albums'
+    | 'faces'
+    | 'owner'
+    | 'library'
+    | 'exifInfo'
+    | 'sharedLinks'
+    | 'smartInfo'
+    | 'smartSearch'
+    | 'tags'
+  >]: AssetEntity[K];
+};
+
 export type AssetCreate = Pick<
   AssetEntity,
   | 'deviceAssetId'
@@ -88,7 +105,7 @@ export type AssetCreate = Pick<
   | 'checksum'
   | 'originalFileName'
 > &
-  Partial<AssetEntity>;
+  Partial<AssetEntityWithoutRelations>;
 
 export interface MonthDay {
   day: number;
@@ -116,18 +133,13 @@ export const IAssetRepository = 'IAssetRepository';
 
 export interface IAssetRepository {
   create(asset: AssetCreate): Promise<AssetEntity>;
-  getByDate(ownerId: string, date: Date): Promise<AssetEntity[]>;
-  getByIds(
-    ids: string[],
-    relations?: FindOptionsRelations<AssetEntity>,
-    select?: FindOptionsSelect<AssetEntity>,
-  ): Promise<AssetEntity[]>;
+  getByIds(ids: string[], relations?: Prisma.AssetsInclude): Promise<AssetEntity[]>;
   getByIdsWithAllRelations(ids: string[]): Promise<AssetEntity[]>;
   getByDayOfYear(ownerId: string, monthDay: MonthDay): Promise<AssetEntity[]>;
   getByChecksum(userId: string, checksum: Buffer): Promise<AssetEntity | null>;
   getByAlbumId(pagination: PaginationOptions, albumId: string): Paginated<AssetEntity>;
   getByUserId(pagination: PaginationOptions, userId: string, options?: AssetSearchOptions): Paginated<AssetEntity>;
-  getById(id: string, relations?: FindOptionsRelations<AssetEntity>): Promise<AssetEntity | null>;
+  getById(id: string, relations?: Prisma.AssetsInclude): Promise<AssetEntity | null>;
   getWithout(pagination: PaginationOptions, property: WithoutProperty): Paginated<AssetEntity>;
   getWith(pagination: PaginationOptions, property: WithProperty, libraryId?: string): Paginated<AssetEntity>;
   getRandom(userId: string, count: number): Promise<AssetEntity[]>;
@@ -138,7 +150,7 @@ export interface IAssetRepository {
   deleteAll(ownerId: string): Promise<void>;
   getAll(pagination: PaginationOptions, options?: AssetSearchOptions): Paginated<AssetEntity>;
   getAllByDeviceId(userId: string, deviceId: string): Promise<string[]>;
-  updateAll(ids: string[], options: Partial<AssetEntity>): Promise<void>;
+  updateAll(ids: string[], options: Partial<Omit<AssetEntity, 'id'>>): Promise<void>;
   save(asset: Pick<AssetEntity, 'id'> & Partial<AssetEntity>): Promise<AssetEntity>;
   remove(asset: AssetEntity): Promise<void>;
   softDeleteAll(ids: string[]): Promise<void>;

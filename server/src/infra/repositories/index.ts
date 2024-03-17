@@ -17,6 +17,7 @@ export * from './metadata.repository';
 export * from './move.repository';
 export * from './partner.repository';
 export * from './person.repository';
+export * from './prisma.repository';
 export * from './search.repository';
 export * from './server-info.repository';
 export * from './shared-link.repository';

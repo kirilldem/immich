@@ -2,6 +2,16 @@ import { bootstrap as admin } from './immich-admin/main';
 import { bootstrap as server } from './immich/main';
 import { bootstrap as microservices } from './microservices/main';
 
+declare global {
+  interface BigInt {
+    toJSON(): number | string;
+  }
+}
+
+BigInt.prototype.toJSON = function () {
+  return this.valueOf() >= Number.MAX_SAFE_INTEGER ? this.toString() : Number(this.valueOf());
+};
+
 const immichApp = process.argv[2] || process.env.IMMICH_APP;
 
 if (process.argv[2] === immichApp) {

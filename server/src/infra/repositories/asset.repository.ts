@@ -1,6 +1,6 @@
 import {
-  AssetBuilderOptions,
   AssetCreate,
+  AssetEntityWithoutRelations,
   AssetExploreFieldOptions,
   AssetPathEntity,
   AssetSearchOptions,
@@ -22,152 +22,114 @@ import {
   WithProperty,
   WithoutProperty,
 } from '@app/domain';
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Prisma } from '@prisma/client';
 import { DateTime } from 'luxon';
-import path from 'node:path';
-import {
-  Brackets,
-  FindOptionsRelations,
-  FindOptionsSelect,
-  FindOptionsWhere,
-  In,
-  IsNull,
-  Not,
-  Repository,
-} from 'typeorm';
-import { AssetEntity, AssetJobStatusEntity, AssetOrder, AssetType, ExifEntity, SmartInfoEntity } from '../entities';
+import { FindOptionsRelations, FindOptionsWhere, IsNull, Not, Repository } from 'typeorm';
+import { AssetEntity, AssetJobStatusEntity, AssetOrder, AssetType, ExifEntity } from '../entities';
 import { DummyValue, GenerateSql } from '../infra.util';
-import { Chunked, ChunkedArray, OptionalBetween, paginate, paginatedBuilder, searchAssetBuilder } from '../infra.utils';
+import { Chunked, ChunkedArray, paginate, paginatedBuilder, searchAssetBuilder } from '../infra.utils';
 import { Instrumentation } from '../instrumentation';
-
-const truncateMap: Record<TimeBucketSize, string> = {
-  [TimeBucketSize.DAY]: 'day',
-  [TimeBucketSize.MONTH]: 'month',
-};
-
-const dateTrunc = (options: TimeBucketOptions) =>
-  `(date_trunc('${
-    truncateMap[options.size]
-  }', (asset."localDateTime" at time zone 'UTC')) at time zone 'UTC')::timestamptz`;
+import { PrismaRepository } from './prisma.repository';
 
 @Instrumentation()
 @Injectable()
 export class AssetRepository implements IAssetRepository {
   constructor(
     @InjectRepository(AssetEntity) private repository: Repository<AssetEntity>,
-    @InjectRepository(ExifEntity) private exifRepository: Repository<ExifEntity>,
-    @InjectRepository(AssetJobStatusEntity) private jobStatusRepository: Repository<AssetJobStatusEntity>,
-    @InjectRepository(SmartInfoEntity) private smartInfoRepository: Repository<SmartInfoEntity>,
+    @Inject(PrismaRepository) private prismaRepository: PrismaRepository,
   ) {}
 
-  async upsertExif(exif: Partial<ExifEntity>): Promise<void> {
-    await this.exifRepository.upsert(exif, { conflictPaths: ['assetId'] });
+  async upsertExif(exif: Partial<ExifEntity> & { assetId: string }): Promise<void> {
+    await this.prismaRepository.exif.upsert({ update: exif, create: exif, where: { assetId: exif.assetId } });
   }
 
-  async upsertJobStatus(jobStatus: Partial<AssetJobStatusEntity>): Promise<void> {
-    await this.jobStatusRepository.upsert(jobStatus, { conflictPaths: ['assetId'] });
+  async upsertJobStatus(jobStatus: Partial<AssetJobStatusEntity> & { assetId: string }): Promise<void> {
+    await this.prismaRepository.assetJobStatus.upsert({
+      update: jobStatus,
+      create: jobStatus,
+      where: { assetId: jobStatus.assetId },
+    });
   }
 
-  create(asset: AssetCreate): Promise<AssetEntity> {
-    return this.repository.save(asset);
+  async create(asset: AssetCreate): Promise<AssetEntity> {
+    const { ownerId, libraryId, livePhotoVideoId, stackId, ...assetData } = asset;
+    const res = await this.prismaRepository.assets.create({
+      data: {
+        ...assetData,
+        livePhotoVideo: livePhotoVideoId ? { connect: { id: livePhotoVideoId } } : undefined,
+        stack: stackId ? { connect: { id: stackId } } : undefined,
+        library: { connect: { id: libraryId } },
+        owner: { connect: { id: ownerId } },
+      },
+    });
+    return res as any as AssetEntity;
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.DATE] })
-  getByDate(ownerId: string, date: Date): Promise<AssetEntity[]> {
-    // For reference of a correct approach although slower
-
-    // let builder = this.repository
-    //   .createQueryBuilder('asset')
-    //   .leftJoin('asset.exifInfo', 'exifInfo')
-    //   .where('asset.ownerId = :ownerId', { ownerId })
-    //   .andWhere(
-    //     `coalesce(date_trunc('day', asset."fileCreatedAt", "exifInfo"."timeZone") at TIME ZONE "exifInfo"."timeZone", date_trunc('day', asset."fileCreatedAt")) IN (:date)`,
-    //     { date },
-    //   )
-    //   .andWhere('asset.isVisible = true')
-    //   .andWhere('asset.isArchived = false')
-    //   .orderBy('asset.fileCreatedAt', 'DESC');
-
-    // return builder.getMany();
-
-    return this.repository.find({
+  @GenerateSql({ params: [DummyValue.UUID, { day: 1, month: 1 }] })
+  async getByDayOfYear(ownerId: string, { day, month }: MonthDay): Promise<AssetEntity[]> {
+    const date = DateTime.utc().set({ day, month });
+    const res = await this.prismaRepository.assets.findMany({
       where: {
         ownerId,
         isVisible: true,
         isArchived: false,
-        resizePath: Not(IsNull()),
-        fileCreatedAt: OptionalBetween(date, DateTime.fromJSDate(date).plus({ day: 1 }).toJSDate()),
+        deletedAt: null,
+        resizePath: { not: null },
+        localDateTime: {
+          gte: date.startOf('day').toJSDate(),
+          lte: date.endOf('day').toJSDate(),
+        },
       },
-      relations: {
+      include: {
         exifInfo: true,
       },
-      order: {
-        fileCreatedAt: 'DESC',
+      orderBy: {
+        localDateTime: 'desc',
       },
     });
-  }
 
-  @GenerateSql({ params: [DummyValue.UUID, { day: 1, month: 1 }] })
-  getByDayOfYear(ownerId: string, { day, month }: MonthDay): Promise<AssetEntity[]> {
-    return this.repository
-      .createQueryBuilder('entity')
-      .where(
-        `entity.ownerId = :ownerId
-      AND entity.isVisible = true
-      AND entity.isArchived = false
-      AND entity.resizePath IS NOT NULL
-      AND EXTRACT(DAY FROM entity.localDateTime AT TIME ZONE 'UTC') = :day
-      AND EXTRACT(MONTH FROM entity.localDateTime AT TIME ZONE 'UTC') = :month`,
-        {
-          ownerId,
-          day,
-          month,
-        },
-      )
-      .leftJoinAndSelect('entity.exifInfo', 'exifInfo')
-      .orderBy('entity.localDateTime', 'DESC')
-      .getMany();
+    return res as any as AssetEntity[];
   }
 
   @GenerateSql({ params: [[DummyValue.UUID]] })
   @ChunkedArray()
-  getByIds(
-    ids: string[],
-    relations?: FindOptionsRelations<AssetEntity>,
-    select?: FindOptionsSelect<AssetEntity>,
-  ): Promise<AssetEntity[]> {
-    return this.repository.find({
-      where: { id: In(ids) },
-      relations,
-      select,
-      withDeleted: true,
+  async getByIds(ids: string[], relations?: Prisma.AssetsInclude): Promise<AssetEntity[]> {
+    const res = await this.prismaRepository.assets.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      include: {
+        ...relations,
+        library: relations?.library ? { include: { assets: true, owner: true } } : undefined,
+      },
     });
+    return res as any as AssetEntity[]; // typeorm type assumes arbitrary level of recursion
   }
 
   @GenerateSql({ params: [[DummyValue.UUID]] })
   @ChunkedArray()
-  getByIdsWithAllRelations(ids: string[]): Promise<AssetEntity[]> {
-    return this.repository.find({
-      where: { id: In(ids) },
-      relations: {
+  async getByIdsWithAllRelations(ids: string[]): Promise<AssetEntity[]> {
+    const res = await this.prismaRepository.assets.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      include: {
         exifInfo: true,
         smartInfo: true,
         tags: true,
         faces: {
-          person: true,
+          include: {
+            person: true,
+          },
         },
-        stack: {
-          assets: true,
-        },
+        stack: { include: { assets: true } },
       },
-      withDeleted: true,
     });
+
+    return res as any as AssetEntity[];
   }
 
   @GenerateSql({ params: [DummyValue.UUID] })
   async deleteAll(ownerId: string): Promise<void> {
-    await this.repository.delete({ ownerId });
+    await this.prismaRepository.assets.deleteMany({ where: { ownerId } });
   }
 
   getByAlbumId(pagination: PaginationOptions, albumId: string): Paginated<AssetEntity> {
@@ -201,33 +163,9 @@ export class AssetRepository implements IAssetRepository {
   }
 
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
-  getByLibraryIdAndOriginalPath(libraryId: string, originalPath: string): Promise<AssetEntity | null> {
-    return this.repository.findOne({
-      where: { library: { id: libraryId }, originalPath: originalPath },
-    });
-  }
-
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.STRING]] })
-  @ChunkedArray({ paramIndex: 1 })
-  async getPathsNotInLibrary(libraryId: string, originalPaths: string[]): Promise<string[]> {
-    const result = await this.repository.query(
-      `
-      WITH paths AS (SELECT unnest($2::text[]) AS path)
-      SELECT path FROM paths
-      WHERE NOT EXISTS (SELECT 1 FROM assets WHERE "libraryId" = $1 AND "originalPath" = path);
-    `,
-      [libraryId, originalPaths],
-    );
-    return result.map((row: { path: string }) => row.path);
-  }
-
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.STRING]] })
-  @ChunkedArray({ paramIndex: 1 })
-  async updateOfflineLibraryAssets(libraryId: string, originalPaths: string[]): Promise<void> {
-    await this.repository.update(
-      { library: { id: libraryId }, originalPath: Not(In(originalPaths)), isOffline: false },
-      { isOffline: true },
-    );
+  async getByLibraryIdAndOriginalPath(libraryId: string, originalPath: string): Promise<AssetEntity | null> {
+    const res = await this.prismaRepository.assets.findFirst({ where: { libraryId, originalPath } });
+    return res as AssetEntity | null;
   }
 
   getAll(pagination: PaginationOptions, options: AssetSearchOptions = {}): Paginated<AssetEntity> {
@@ -250,87 +188,104 @@ export class AssetRepository implements IAssetRepository {
    */
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
   async getAllByDeviceId(ownerId: string, deviceId: string): Promise<string[]> {
-    const items = await this.repository.find({
-      select: { deviceAssetId: true },
+    const items = await this.prismaRepository.assets.findMany({
       where: {
         ownerId,
         deviceId,
         isVisible: true,
       },
-      withDeleted: true,
+      select: {
+        deviceAssetId: true,
+      },
     });
 
     return items.map((asset) => asset.deviceAssetId);
   }
 
   @GenerateSql({ params: [DummyValue.UUID] })
-  getById(id: string, relations: FindOptionsRelations<AssetEntity>): Promise<AssetEntity | null> {
-    return this.repository.findOne({
-      where: { id },
-      relations,
-      // We are specifically asking for this asset. Return it even if it is soft deleted
-      withDeleted: true,
-    });
+  async getById(id: string, relations: Prisma.AssetsInclude): Promise<AssetEntity | null> {
+    const items = await this.prismaRepository.assets.findFirst({ where: { id }, include: relations });
+    return items as any as AssetEntity | null;
   }
 
   @GenerateSql({ params: [[DummyValue.UUID], { deviceId: DummyValue.STRING }] })
   @Chunked()
   async updateAll(ids: string[], options: Partial<AssetEntity>): Promise<void> {
-    await this.repository.update({ id: In(ids) }, options);
+    await this.prismaRepository.assets.updateMany({ where: { id: { in: ids } }, data: options });
   }
 
   @Chunked()
   async softDeleteAll(ids: string[]): Promise<void> {
-    await this.repository.softDelete({ id: In(ids), isExternal: false });
+    await this.prismaRepository.assets.updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
   }
 
   @Chunked()
   async restoreAll(ids: string[]): Promise<void> {
-    await this.repository.restore({ id: In(ids) });
+    await this.prismaRepository.assets.updateMany({ where: { id: { in: ids } }, data: { deletedAt: null } });
   }
 
-  async save(asset: Partial<AssetEntity>): Promise<AssetEntity> {
-    const { id } = await this.repository.save(asset);
-    return this.repository.findOneOrFail({
-      where: { id },
-      relations: {
+  async save(asset: AssetEntityWithoutRelations): Promise<AssetEntity> {
+    const { ownerId, libraryId, livePhotoVideoId, stackId, ...assetData } = asset;
+
+    const res = await this.prismaRepository.assets.upsert({
+      update: assetData,
+      create: {
+        ...assetData,
+        livePhotoVideo: livePhotoVideoId ? { connect: { id: livePhotoVideoId } } : undefined,
+        owner: { connect: { id: ownerId } },
+        library: { connect: { id: libraryId } },
+        // stack: stackId
+        //   ? {
+        //       connectOrCreate: {
+        //         create: { id: stackId, primaryAsset: { connect: { id: asset.id } } },
+        //         where: { id: stackId },
+        //       },
+        //     }
+        //   : undefined,
+      },
+      where: { id: asset.id },
+      include: {
         exifInfo: true,
-        owner: true,
         smartInfo: true,
         tags: true,
         faces: {
-          person: true,
+          include: {
+            person: true,
+          },
         },
       },
-      withDeleted: true,
     });
+
+    return res as any as AssetEntity; // typeorm type assumes all relations are included
   }
 
   async remove(asset: AssetEntity): Promise<void> {
-    await this.repository.remove(asset);
+    await this.prismaRepository.assets.delete({ where: { id: asset.id } });
   }
 
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.BUFFER] })
-  getByChecksum(userId: string, checksum: Buffer): Promise<AssetEntity | null> {
-    return this.repository.findOne({ where: { ownerId: userId, checksum } });
+  async getByChecksum(userId: string, checksum: Buffer): Promise<AssetEntity | null> {
+    const item = await this.prismaRepository.assets.findFirst({ where: { ownerId: userId, checksum: checksum } });
+    return item as AssetEntity | null;
   }
 
-  findLivePhotoMatch(options: LivePhotoSearchOptions): Promise<AssetEntity | null> {
+  async findLivePhotoMatch(options: LivePhotoSearchOptions): Promise<AssetEntity | null> {
     const { ownerId, otherAssetId, livePhotoCID, type } = options;
 
-    return this.repository.findOne({
+    const item = await this.prismaRepository.assets.findFirst({
       where: {
-        id: Not(otherAssetId),
+        id: { not: otherAssetId },
         ownerId,
         type,
         exifInfo: {
           livePhotoCID,
         },
       },
-      relations: {
+      include: {
         exifInfo: true,
       },
     });
+    return item as AssetEntity | null;
   }
 
   @GenerateSql(
@@ -494,50 +449,71 @@ export class AssetRepository implements IAssetRepository {
     });
   }
 
-  getFirstAssetForAlbumId(albumId: string): Promise<AssetEntity | null> {
-    return this.repository.findOne({
-      where: { albums: { id: albumId } },
-      order: { fileCreatedAt: 'DESC' },
+  async getFirstAssetForAlbumId(albumId: string): Promise<AssetEntity | null> {
+    const items = await this.prismaRepository.assets.findFirst({
+      where: {
+        albums: {
+          some: {
+            id: albumId,
+          },
+        },
+      },
+      orderBy: {
+        fileCreatedAt: 'desc',
+      },
     });
+
+    return items as AssetEntity | null;
   }
 
-  getLastUpdatedAssetForAlbumId(albumId: string): Promise<AssetEntity | null> {
-    return this.repository.findOne({
-      where: { albums: { id: albumId } },
-      order: { updatedAt: 'DESC' },
+  async getLastUpdatedAssetForAlbumId(albumId: string): Promise<AssetEntity | null> {
+    const items = await this.prismaRepository.assets.findFirst({
+      where: {
+        albums: {
+          some: {
+            id: albumId,
+          },
+        },
+      },
+      orderBy: {
+        updatedAt: 'desc',
+      },
     });
+
+    return items as AssetEntity | null;
   }
 
   async getMapMarkers(ownerIds: string[], options: MapMarkerSearchOptions = {}): Promise<MapMarker[]> {
     const { isArchived, isFavorite, fileCreatedAfter, fileCreatedBefore } = options;
 
-    const assets = await this.repository.find({
+    const assets = await this.prismaRepository.assets.findMany({
       select: {
         id: true,
         exifInfo: {
-          city: true,
-          state: true,
-          country: true,
-          latitude: true,
-          longitude: true,
+          select: {
+            city: true,
+            state: true,
+            country: true,
+            latitude: true,
+            longitude: true,
+          },
         },
       },
       where: {
-        ownerId: In([...ownerIds]),
+        ownerId: {
+          in: ownerIds,
+        },
         isVisible: true,
         isArchived,
         exifInfo: {
-          latitude: Not(IsNull()),
-          longitude: Not(IsNull()),
+          latitude: { not: null },
+          longitude: { not: null },
         },
         isFavorite,
-        fileCreatedAt: OptionalBetween(fileCreatedAfter, fileCreatedBefore),
+        fileCreatedAt: { gte: fileCreatedAfter, lte: fileCreatedBefore },
       },
-      relations: {
-        exifInfo: true,
-      },
-      order: {
-        fileCreatedAt: 'DESC',
+      orderBy: {
+        fileCreatedAt: 'desc',
       },
     });
 
@@ -551,29 +527,20 @@ export class AssetRepository implements IAssetRepository {
     }));
   }
 
-  async getStatistics(ownerId: string, options: AssetStatsOptions): Promise<AssetStats> {
-    let builder = this.repository
-      .createQueryBuilder('asset')
-      .select(`COUNT(asset.id)`, 'count')
-      .addSelect(`asset.type`, 'type')
-      .where('"ownerId" = :ownerId', { ownerId })
-      .andWhere('asset.isVisible = true')
-      .groupBy('asset.type');
-
-    const { isArchived, isFavorite, isTrashed } = options;
-    if (isArchived !== undefined) {
-      builder = builder.andWhere(`asset.isArchived = :isArchived`, { isArchived });
-    }
-
-    if (isFavorite !== undefined) {
-      builder = builder.andWhere(`asset.isFavorite = :isFavorite`, { isFavorite });
-    }
-
-    if (isTrashed !== undefined) {
-      builder = builder.withDeleted().andWhere(`asset.deletedAt is not null`);
-    }
-
-    const items = await builder.getRawMany();
+  async getStatistics(ownerId: string, { isArchived, isFavorite, isTrashed }: AssetStatsOptions): Promise<AssetStats> {
+    const items = await this.prismaRepository.assets.groupBy({
+      by: 'type',
+      where: {
+        ownerId,
+        isVisible: true,
+        isArchived,
+        isFavorite,
+        deletedAt: isTrashed ? { not: null } : null,
+      },
+      _count: {
+        id: true,
+      },
+    });
 
     const result: AssetStats = {
       [AssetType.AUDIO]: 0,
@@ -583,46 +550,84 @@ export class AssetRepository implements IAssetRepository {
     };
 
     for (const item of items) {
-      result[item.type as AssetType] = Number(item.count) || 0;
+      result[item.type as AssetType] = item._count.id;
     }
 
     return result;
   }
 
-  getRandom(ownerId: string, count: number): Promise<AssetEntity[]> {
-    // can't use queryBuilder because of custom OFFSET clause
-    return this.repository.query(
-      `SELECT *
-       FROM assets
-       WHERE "ownerId" = $1
-       OFFSET FLOOR(RANDOM() * (SELECT GREATEST(COUNT(*) - $2, 0) FROM ASSETS WHERE "ownerId" = $1)) LIMIT $2`,
-      [ownerId, count],
-    );
+  async getRandom(ownerId: string, take: number): Promise<AssetEntity[]> {
+    const where = {
+      ownerId,
+      isVisible: true,
+      deletedAt: null,
+    };
+
+    const count = await this.prismaRepository.assets.count({ where });
+    const skip = Math.floor(Math.random() * Math.max(count - take, 0));
+    const items = await this.prismaRepository.assets.findMany({ where, take, skip });
+
+    return items as any as AssetEntity[];
   }
 
   @GenerateSql({ params: [{ size: TimeBucketSize.MONTH }] })
-  getTimeBuckets(options: TimeBucketOptions): Promise<TimeBucketItem[]> {
-    const truncated = dateTrunc(options);
-    return this.getBuilder(options)
-      .select(`COUNT(asset.id)::int`, 'count')
-      .addSelect(truncated, 'timeBucket')
-      .groupBy(truncated)
-      .orderBy(truncated, options.order === AssetOrder.ASC ? 'ASC' : 'DESC')
-      .getRawMany();
+  async getTimeBuckets(options: TimeBucketOptions): Promise<TimeBucketItem[]> {
+    const items = await this.prismaRepository.assets.groupBy({
+      by: 'truncatedDate',
+      where: {
+        ownerId: {
+          in: options.userIds,
+        },
+        isVisible: true,
+        isArchived: options.isArchived,
+        isFavorite: options.isFavorite,
+        deletedAt: options.isTrashed ? { not: null } : null,
+        albums: options.albumId ? { some: { id: options.albumId } } : undefined,
+        faces: options.personId ? { some: { personId: options.personId } } : undefined,
+        type: options.assetType,
+      },
+      _count: {
+        id: true,
+      },
+    });
+
+    return items.map((item) => ({
+      timeBucket: item.truncatedDate.toISOString(),
+      count: item._count.id,
+    }));
   }
 
   @GenerateSql({ params: [DummyValue.TIME_BUCKET, { size: TimeBucketSize.MONTH }] })
-  getTimeBucket(timeBucket: string, options: TimeBucketOptions): Promise<AssetEntity[]> {
-    const truncated = dateTrunc(options);
-    return (
-      this.getBuilder(options)
-        .andWhere(`${truncated} = :timeBucket`, { timeBucket: timeBucket.replace(/^[+-]/, '') })
-        // First sort by the day in localtime (put it in the right bucket)
-        .orderBy(truncated, 'DESC')
-        // and then sort by the actual time
-        .addOrderBy('asset.fileCreatedAt', options.order === AssetOrder.ASC ? 'ASC' : 'DESC')
-        .getMany()
-    );
+  async getTimeBucket(timeBucket: string, options: TimeBucketOptions): Promise<AssetEntity[]> {
+    const items = await this.prismaRepository.assets.findMany({
+      where: {
+        ownerId: {
+          in: options.userIds,
+        },
+        isVisible: true,
+        isArchived: options.isArchived,
+        isFavorite: options.isFavorite,
+        deletedAt: options.isTrashed ? { not: null } : null,
+        truncatedDate: timeBucket.replace(/^[+-]/, ''),
+        albums: options.albumId ? { some: { id: options.albumId } } : undefined,
+        faces: options.personId ? { some: { personId: options.personId } } : undefined,
+        type: options.assetType,
+        // OR: options.withStacked ? [{ stack: { primaryAssetId: '' } }, { stackId: null }] : undefined,
+      },
+      orderBy: [
+        { truncatedDate: 'desc' },
+        {
+          fileCreatedAt: options.order === AssetOrder.ASC ? 'asc' : 'desc',
+        },
+      ],
+      include: {
+        exifInfo: options.exifInfo,
+        owner: true,
+        stack: { include: { assets: true } },
+      },
+    });
+
+    return items as any as AssetEntity[];
   }
 
   @GenerateSql({ params: [DummyValue.UUID, { minAssetsPerField: 5, maxFields: 12 }] })
@@ -630,28 +635,44 @@ export class AssetRepository implements IAssetRepository {
     ownerId: string,
     { minAssetsPerField, maxFields }: AssetExploreFieldOptions,
   ): Promise<SearchExploreItem<string>> {
-    const cte = this.exifRepository
-      .createQueryBuilder('e')
-      .select('city')
-      .groupBy('city')
-      .having('count(city) >= :minAssetsPerField', { minAssetsPerField });
+    const res = await this.prismaRepository.exif.groupBy({
+      by: 'city',
+      where: {
+        assets: { ownerId, isVisible: true, isArchived: false, deletedAt: null, type: AssetType.IMAGE },
+        city: { not: null },
+      },
+      having: {
+        assetId: {
+          _count: {
+            gte: minAssetsPerField,
+          },
+        },
+      },
+      take: maxFields,
+      orderBy: {
+        city: 'desc',
+      },
+    });
 
-    const items = await this.getBuilder({
-      userIds: [ownerId],
-      exifInfo: false,
-      assetType: AssetType.IMAGE,
-      isArchived: false,
-    })
-      .select('c.city', 'value')
-      .addSelect('asset.id', 'data')
-      .distinctOn(['c.city'])
-      .innerJoin('exif', 'e', 'asset.id = e."assetId"')
-      .addCommonTableExpression(cte, 'cities')
-      .innerJoin('cities', 'c', 'c.city = e.city')
-      .limit(maxFields)
-      .getRawMany();
+    const cities = res.map((item) => item.city!);
 
-    return { fieldName: 'exifInfo.city', items };
+    const items = await this.prismaRepository.exif.findMany({
+      where: {
+        city: {
+          in: cities,
+        },
+      },
+      select: {
+        city: true,
+        assetId: true,
+      },
+      distinct: ['city'],
+    });
+
+    return {
+      fieldName: 'exifInfo.city',
+      items: items.map((item) => ({ value: item.city!, data: item.assetId })),
+    };
   }
 
   @GenerateSql({ params: [DummyValue.UUID, { minAssetsPerField: 5, maxFields: 12 }] })
@@ -659,85 +680,42 @@ export class AssetRepository implements IAssetRepository {
     ownerId: string,
     { minAssetsPerField, maxFields }: AssetExploreFieldOptions,
   ): Promise<SearchExploreItem<string>> {
-    const cte = this.smartInfoRepository
-      .createQueryBuilder('si')
-      .select('unnest(tags)', 'tag')
-      .groupBy('tag')
-      .having('count(*) >= :minAssetsPerField', { minAssetsPerField });
+    const res = await this.prismaRepository.smartInfo.groupBy({
+      by: 'tags',
+      where: {
+        assets: { ownerId, isVisible: true, isArchived: false, deletedAt: null, type: AssetType.IMAGE },
+      },
+      having: {
+        assetId: {
+          _count: {
+            gte: minAssetsPerField,
+          },
+        },
+      },
+      take: maxFields,
+      orderBy: {
+        tags: 'desc',
+      },
+    });
 
-    const items = await this.getBuilder({
-      userIds: [ownerId],
-      exifInfo: false,
-      assetType: AssetType.IMAGE,
-      isArchived: false,
-    })
-      .select('unnest(si.tags)', 'value')
-      .addSelect('asset.id', 'data')
-      .distinctOn(['unnest(si.tags)'])
-      .innerJoin('smart_info', 'si', 'asset.id = si."assetId"')
-      .addCommonTableExpression(cte, 'random_tags')
-      .innerJoin('random_tags', 't', 'si.tags @> ARRAY[t.tag]')
-      .limit(maxFields)
-      .getRawMany();
+    const tags = res.flatMap((item) => item.tags!);
 
-    return { fieldName: 'smartInfo.tags', items };
-  }
+    const items = await this.prismaRepository.smartInfo.findMany({
+      where: {
+        tags: {
+          hasSome: tags,
+        },
+      },
+      select: {
+        tags: true,
+        assetId: true,
+      },
+    });
 
-  private getBuilder(options: AssetBuilderOptions) {
-    const { isArchived, isFavorite, isTrashed, albumId, personId, userIds, withStacked, exifInfo, assetType } = options;
-
-    let builder = this.repository.createQueryBuilder('asset').where('asset.isVisible = true');
-    if (assetType !== undefined) {
-      builder = builder.andWhere('asset.type = :assetType', { assetType });
-    }
-
-    let stackJoined = false;
-
-    if (exifInfo !== false) {
-      stackJoined = true;
-      builder = builder
-        .leftJoinAndSelect('asset.exifInfo', 'exifInfo')
-        .leftJoinAndSelect('asset.stack', 'stack')
-        .leftJoinAndSelect('stack.assets', 'stackedAssets');
-    }
-
-    if (albumId) {
-      builder = builder.leftJoin('asset.albums', 'album').andWhere('album.id = :albumId', { albumId });
-    }
-
-    if (userIds) {
-      builder = builder.andWhere('asset.ownerId IN (:...userIds )', { userIds });
-    }
-
-    if (isArchived !== undefined) {
-      builder = builder.andWhere('asset.isArchived = :isArchived', { isArchived });
-    }
-
-    if (isFavorite !== undefined) {
-      builder = builder.andWhere('asset.isFavorite = :isFavorite', { isFavorite });
-    }
-
-    if (isTrashed !== undefined) {
-      builder = builder.andWhere(`asset.deletedAt ${isTrashed ? 'IS NOT NULL' : 'IS NULL'}`).withDeleted();
-    }
-
-    if (personId !== undefined) {
-      builder = builder
-        .innerJoin('asset.faces', 'faces')
-        .innerJoin('faces.person', 'person')
-        .andWhere('person.id = :personId', { personId });
-    }
-
-    if (withStacked) {
-      if (!stackJoined) {
-        builder = builder.leftJoinAndSelect('asset.stack', 'stack').leftJoinAndSelect('stack.assets', 'stackedAssets');
-      }
-      builder = builder.andWhere(
-        new Brackets((qb) => qb.where('stack.primaryAssetId = asset.id').orWhere('asset.stackId IS NULL')),
-      );
-    }
-
-    return builder;
+    return {
+      fieldName: 'smartInfo.tags',
+      items: items.map((item) => ({ value: item.tags![0], data: item.assetId })),
+    };
   }
 
   @GenerateSql({ params: [DummyValue.STRING, [DummyValue.UUID], { numResults: 250 }] })
@@ -746,85 +724,81 @@ export class AssetRepository implements IAssetRepository {
     userIds: string[],
     { numResults }: MetadataSearchOptions,
   ): Promise<AssetEntity[]> {
-    const rows = await this.getBuilder({
-      userIds: userIds,
-      exifInfo: false,
-      isArchived: false,
-    })
-      .select('asset.*')
-      .addSelect('e.*')
-      .addSelect('COALESCE(si.tags, array[]::text[])', 'tags')
-      .addSelect('COALESCE(si.objects, array[]::text[])', 'objects')
-      .innerJoin('exif', 'e', 'asset."id" = e."assetId"')
-      .leftJoin('smart_info', 'si', 'si."assetId" = asset."id"')
-      .andWhere(
-        new Brackets((qb) => {
-          qb.where(
-            `(e."exifTextSearchableColumn" || COALESCE(si."smartInfoTextSearchableColumn", to_tsvector('english', '')))
-          @@ PLAINTO_TSQUERY('english', :query)`,
-            { query },
-          ).orWhere('asset."originalFileName" = :path', { path: path.parse(query).name });
-        }),
-      )
-      .addOrderBy('asset.fileCreatedAt', 'DESC')
-      .limit(numResults)
-      .getRawMany();
+    const items = await this.prismaRepository.assets.findMany({
+      where: {
+        ownerId: {
+          in: userIds,
+        },
+        isVisible: true,
+        isArchived: false,
+        deletedAt: null,
+        OR: [
+          {
+            originalFileName: {
+              contains: query,
+            },
+          },
+          {
+            exifInfo: {
+              city: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              description: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              lensModel: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              make: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              model: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              state: {
+                contains: query,
+              },
+            },
+          },
+          {
+            exifInfo: {
+              country: {
+                contains: query,
+              },
+            },
+          },
+        ],
+      },
+      orderBy: {
+        fileCreatedAt: 'desc',
+      },
+      take: numResults,
+      include: {
+        exifInfo: true,
+        smartInfo: true,
+      },
+    });
 
-    return rows.map(
-      ({
-        tags,
-        objects,
-        country,
-        state,
-        city,
-        description,
-        model,
-        make,
-        dateTimeOriginal,
-        exifImageHeight,
-        exifImageWidth,
-        exposureTime,
-        fNumber,
-        fileSizeInByte,
-        focalLength,
-        iso,
-        latitude,
-        lensModel,
-        longitude,
-        modifyDate,
-        projectionType,
-        timeZone,
-        ...assetInfo
-      }) =>
-        ({
-          exifInfo: {
-            city,
-            country,
-            dateTimeOriginal,
-            description,
-            exifImageHeight,
-            exifImageWidth,
-            exposureTime,
-            fNumber,
-            fileSizeInByte,
-            focalLength,
-            iso,
-            latitude,
-            lensModel,
-            longitude,
-            make,
-            model,
-            modifyDate,
-            projectionType,
-            state,
-            timeZone,
-          },
-          smartInfo: {
-            tags,
-            objects,
-          },
-          ...assetInfo,
-        }) as AssetEntity,
-    );
+    return items as any as AssetEntity[];
   }
 }

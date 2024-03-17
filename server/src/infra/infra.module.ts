@@ -58,6 +58,7 @@ import {
   MoveRepository,
   PartnerRepository,
   PersonRepository,
+  PrismaRepository,
   SearchRepository,
   ServerInfoRepository,
   SharedLinkRepository,
@@ -96,6 +97,7 @@ const providers: Provider[] = [
   { provide: IMediaRepository, useClass: MediaRepository },
   { provide: IUserRepository, useClass: UserRepository },
   { provide: IUserTokenRepository, useClass: UserTokenRepository },
+  { provide: PrismaRepository, useClass: PrismaRepository },
   SchedulerRegistry,
 ];
 
