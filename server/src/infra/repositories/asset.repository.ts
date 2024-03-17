@@ -589,6 +589,9 @@ export class AssetRepository implements IAssetRepository {
       _count: {
         id: true,
       },
+      orderBy: {
+        truncatedDate: 'desc',
+      },
     });
 
     return items.map((item) => ({
@@ -612,19 +615,14 @@ export class AssetRepository implements IAssetRepository {
         albums: options.albumId ? { some: { id: options.albumId } } : undefined,
         faces: options.personId ? { some: { personId: options.personId } } : undefined,
         type: options.assetType,
-        // OR: options.withStacked ? [{ stack: { primaryAssetId: '' } }, { stackId: null }] : undefined,
       },
-      orderBy: [
-        { truncatedDate: 'desc' },
-        {
-          fileCreatedAt: options.order === AssetOrder.ASC ? 'asc' : 'desc',
-        },
-      ],
+      orderBy: { fileCreatedAt: options.order === AssetOrder.ASC ? 'asc' : 'desc' },
       include: {
-        exifInfo: options.exifInfo,
         owner: true,
-        stack: { include: { assets: true } },
+        exifInfo: options.exifInfo,
+        stack: options.withStacked ? { include: { assets: true } } : undefined,
       },
+      relationLoadStrategy: 'query', // this seems faster than 'join' in this case
     });
 
     return items as any as AssetEntity[];
