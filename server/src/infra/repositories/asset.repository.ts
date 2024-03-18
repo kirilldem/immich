@@ -75,7 +75,6 @@ export class AssetRepository implements IAssetRepository {
         ownerId,
         isVisible: true,
         isArchived: false,
-        deletedAt: null,
         resizePath: { not: null },
         localDateTime: {
           gte: date.startOf('day').toJSDate(),
@@ -97,7 +96,7 @@ export class AssetRepository implements IAssetRepository {
   @ChunkedArray()
   async getByIds(ids: string[], relations?: Prisma.AssetsInclude): Promise<AssetEntity[]> {
     const res = await this.prismaRepository.assets.findMany({
-      where: { id: { in: ids }, deletedAt: null },
+      where: { id: { in: ids } },
       include: {
         ...relations,
         library: relations?.library ? { include: { assets: true, owner: true } } : undefined,
@@ -110,7 +109,7 @@ export class AssetRepository implements IAssetRepository {
   @ChunkedArray()
   async getByIdsWithAllRelations(ids: string[]): Promise<AssetEntity[]> {
     const res = await this.prismaRepository.assets.findMany({
-      where: { id: { in: ids }, deletedAt: null },
+      where: { id: { in: ids } },
       include: {
         exifInfo: true,
         smartInfo: true,
@@ -567,7 +566,6 @@ export class AssetRepository implements IAssetRepository {
     const where = {
       ownerId,
       isVisible: true,
-      deletedAt: null,
     };
 
     const count = await this.prismaRepository.assets.count({ where });
@@ -643,7 +641,7 @@ export class AssetRepository implements IAssetRepository {
     const res = await this.prismaRepository.exif.groupBy({
       by: 'city',
       where: {
-        assets: { ownerId, isVisible: true, isArchived: false, deletedAt: null, type: AssetType.IMAGE },
+        assets: { ownerId, isVisible: true, isArchived: false, type: AssetType.IMAGE },
         city: { not: null },
       },
       having: {
@@ -688,7 +686,7 @@ export class AssetRepository implements IAssetRepository {
     const res = await this.prismaRepository.smartInfo.groupBy({
       by: 'tags',
       where: {
-        assets: { ownerId, isVisible: true, isArchived: false, deletedAt: null, type: AssetType.IMAGE },
+        assets: { ownerId, isVisible: true, isArchived: false, type: AssetType.IMAGE },
       },
       having: {
         assetId: {
@@ -736,7 +734,6 @@ export class AssetRepository implements IAssetRepository {
         },
         isVisible: true,
         isArchived: false,
-        deletedAt: null,
         OR: [
           {
             originalFileName: {
