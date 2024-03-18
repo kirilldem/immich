@@ -34,7 +34,10 @@ export const isValidInteger = (value: number, options: { min?: number; max?: num
   return Number.isInteger(value) && value >= min && value <= max;
 };
 
-function paginationHelper<Entity extends ObjectLiteral>(items: Entity[], take: number): PaginationResult<Entity> {
+export function paginationHelper<Entity extends ObjectLiteral>(
+  items: Entity[],
+  take: number,
+): PaginationResult<Entity> {
   const hasNextPage = items.length > take;
   items.splice(take);
 

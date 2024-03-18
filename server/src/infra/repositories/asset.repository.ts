@@ -26,10 +26,10 @@ import { Inject, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Prisma } from '@prisma/client';
 import { DateTime } from 'luxon';
-import { FindOptionsRelations, FindOptionsWhere, IsNull, Not, Repository } from 'typeorm';
+import { Repository } from 'typeorm';
 import { AssetEntity, AssetJobStatusEntity, AssetOrder, AssetType, ExifEntity } from '../entities';
 import { DummyValue, GenerateSql } from '../infra.util';
-import { Chunked, ChunkedArray, paginate, paginatedBuilder, searchAssetBuilder } from '../infra.utils';
+import { Chunked, ChunkedArray, paginatedBuilder, paginationHelper, searchAssetBuilder } from '../infra.utils';
 import { Instrumentation } from '../instrumentation';
 import { PrismaRepository } from './prisma.repository';
 
@@ -132,18 +132,23 @@ export class AssetRepository implements IAssetRepository {
     await this.prismaRepository.assets.deleteMany({ where: { ownerId } });
   }
 
-  getByAlbumId(pagination: PaginationOptions, albumId: string): Paginated<AssetEntity> {
-    return paginate(this.repository, pagination, {
+  async getByAlbumId(pagination: PaginationOptions, albumId: string): Paginated<AssetEntity> {
+    const items = await this.prismaRepository.assets.findMany({
       where: {
         albums: {
-          id: albumId,
+          some: {
+            id: albumId,
+          },
         },
       },
-      relations: {
-        albums: true,
-        exifInfo: true,
+      orderBy: {
+        fileCreatedAt: 'desc',
       },
+      skip: pagination.skip,
+      take: pagination.take + 1,
     });
+
+    return paginationHelper(items as any as AssetEntity[], pagination.take);
   }
 
   getByUserId(
@@ -155,11 +160,16 @@ export class AssetRepository implements IAssetRepository {
   }
 
   @GenerateSql({ params: [[DummyValue.UUID]] })
-  getLibraryAssetPaths(pagination: PaginationOptions, libraryId: string): Paginated<AssetPathEntity> {
-    return paginate(this.repository, pagination, {
+  async getLibraryAssetPaths(pagination: PaginationOptions, libraryId: string): Paginated<AssetPathEntity> {
+    const items = await this.prismaRepository.assets.findMany({
+      where: { libraryId },
       select: { id: true, originalPath: true, isOffline: true },
-      where: { library: { id: libraryId } },
+      orderBy: { fileCreatedAt: 'desc' },
+      skip: pagination.skip,
+      take: pagination.take + 1,
     });
+
+    return paginationHelper(items as any as AssetPathEntity[], pagination.take);
   }
 
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
@@ -296,68 +306,53 @@ export class AssetRepository implements IAssetRepository {
         params: [DummyValue.PAGINATION, property],
       })),
   )
-  getWithout(pagination: PaginationOptions, property: WithoutProperty): Paginated<AssetEntity> {
-    let relations: FindOptionsRelations<AssetEntity> = {};
-    let where: FindOptionsWhere<AssetEntity> | FindOptionsWhere<AssetEntity>[] = {};
+  async getWithout(pagination: PaginationOptions, property: WithoutProperty): Paginated<AssetEntity> {
+    let relations: Prisma.AssetsInclude = {};
+    let where: Prisma.AssetsWhereInput = {};
 
     switch (property) {
       case WithoutProperty.THUMBNAIL: {
-        where = [
-          { resizePath: IsNull(), isVisible: true },
-          { resizePath: '', isVisible: true },
-          { webpPath: IsNull(), isVisible: true },
-          { webpPath: '', isVisible: true },
-          { thumbhash: IsNull(), isVisible: true },
-        ];
+        where = {
+          OR: [
+            { resizePath: null, isVisible: true },
+            { resizePath: '', isVisible: true },
+            { webpPath: null, isVisible: true },
+            { webpPath: '', isVisible: true },
+            { thumbhash: null, isVisible: true },
+          ],
+        };
         break;
       }
 
       case WithoutProperty.ENCODED_VIDEO: {
-        where = [
-          { type: AssetType.VIDEO, encodedVideoPath: IsNull() },
-          { type: AssetType.VIDEO, encodedVideoPath: '' },
-        ];
+        where = {
+          OR: [
+            { type: AssetType.VIDEO, encodedVideoPath: null },
+            { type: AssetType.VIDEO, encodedVideoPath: '' },
+          ],
+        };
         break;
       }
 
       case WithoutProperty.EXIF: {
         relations = {
           exifInfo: true,
-          jobStatus: true,
+          assetJobStatus: true,
         };
         where = {
           isVisible: true,
-          jobStatus: {
-            metadataExtractedAt: IsNull(),
+          assetJobStatus: {
+            metadataExtractedAt: null,
           },
         };
         break;
       }
 
       case WithoutProperty.SMART_SEARCH: {
-        relations = {
-          smartSearch: true,
-        };
         where = {
           isVisible: true,
-          resizePath: Not(IsNull()),
-          smartSearch: {
-            embedding: IsNull(),
-          },
-        };
-        break;
-      }
-
-      case WithoutProperty.OBJECT_TAGS: {
-        relations = {
-          smartInfo: true,
-        };
-        where = {
-          resizePath: Not(IsNull()),
-          isVisible: true,
-          smartInfo: {
-            tags: IsNull(),
-          },
+          resizePath: { not: null },
+          smartSearch: null,
         };
         break;
       }
@@ -365,17 +360,18 @@ export class AssetRepository implements IAssetRepository {
       case WithoutProperty.FACES: {
         relations = {
           faces: true,
-          jobStatus: true,
+          assetJobStatus: true,
         };
         where = {
-          resizePath: Not(IsNull()),
+          resizePath: { not: null },
           isVisible: true,
           faces: {
-            assetId: IsNull(),
-            personId: IsNull(),
+            some: {
+              person: null,
+            },
           },
-          jobStatus: {
-            facesRecognizedAt: IsNull(),
+          assetJobStatus: {
+            facesRecognizedAt: null,
           },
         };
         break;
@@ -386,21 +382,24 @@ export class AssetRepository implements IAssetRepository {
           faces: true,
         };
         where = {
-          resizePath: Not(IsNull()),
+          resizePath: { not: null },
           isVisible: true,
           faces: {
-            assetId: Not(IsNull()),
-            personId: IsNull(),
+            some: {
+              person: null,
+            },
           },
         };
         break;
       }
 
       case WithoutProperty.SIDECAR: {
-        where = [
-          { sidecarPath: IsNull(), isVisible: true },
-          { sidecarPath: '', isVisible: true },
-        ];
+        where = {
+          OR: [
+            { sidecarPath: null, isVisible: true },
+            { sidecarPath: '', isVisible: true },
+          ],
+        };
         break;
       }
 
@@ -409,29 +408,33 @@ export class AssetRepository implements IAssetRepository {
       }
     }
 
-    return paginate(this.repository, pagination, {
-      relations,
+    const items = await this.prismaRepository.assets.findMany({
       where,
-      order: {
+      orderBy: {
         // Ensures correct order when paginating
-        createdAt: 'ASC',
+        createdAt: 'asc',
       },
+      skip: pagination.skip,
+      take: pagination.take + 1,
+      include: relations,
     });
+
+    return paginationHelper(items as any as AssetEntity[], pagination.take);
   }
 
-  getWith(pagination: PaginationOptions, property: WithProperty, libraryId?: string): Paginated<AssetEntity> {
-    let where: FindOptionsWhere<AssetEntity> | FindOptionsWhere<AssetEntity>[] = {};
+  async getWith(pagination: PaginationOptions, property: WithProperty, libraryId?: string): Paginated<AssetEntity> {
+    let where: Prisma.AssetsWhereInput = {};
 
     switch (property) {
       case WithProperty.SIDECAR: {
-        where = [{ sidecarPath: Not(IsNull()), isVisible: true }];
+        where = { sidecarPath: { not: null }, isVisible: true };
         break;
       }
       case WithProperty.IS_OFFLINE: {
         if (!libraryId) {
           throw new Error('Library id is required when finding offline assets');
         }
-        where = [{ isOffline: true, libraryId: libraryId }];
+        where = { isOffline: true, libraryId: libraryId };
         break;
       }
 
@@ -440,13 +443,17 @@ export class AssetRepository implements IAssetRepository {
       }
     }
 
-    return paginate(this.repository, pagination, {
+    const items = await this.prismaRepository.assets.findMany({
       where,
-      order: {
+      orderBy: {
         // Ensures correct order when paginating
-        createdAt: 'ASC',
+        createdAt: 'asc',
       },
+      skip: pagination.skip,
+      take: pagination.take + 1,
     });
+
+    return paginationHelper(items as any as AssetEntity[], pagination.take);
   }
 
   async getFirstAssetForAlbumId(albumId: string): Promise<AssetEntity | null> {
